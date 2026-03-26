@@ -16,6 +16,8 @@ using Soenneker.Utils.Directory.Abstract;
 using Soenneker.Utils.File.Abstract;
 using Soenneker.Utils.File.Download.Abstract;
 using System.Collections.Generic;
+using Soenneker.OpenApi.Fixer.Abstract;
+using Soenneker.Utils.Yaml.Abstract;
 
 namespace Soenneker.GitLab.Runners.OpenApiClient.Utils;
 
@@ -30,9 +32,12 @@ public sealed class FileOperationsUtil : IFileOperationsUtil
     private readonly IFileDownloadUtil _fileDownloadUtil;
     private readonly IFileUtil _fileUtil;
     private readonly IDirectoryUtil _directoryUtil;
+    private readonly IOpenApiFixer _openApiFixer;
+    private readonly IYamlUtil _yamlUtil;
 
-    public FileOperationsUtil(ILogger<FileOperationsUtil> logger, IConfiguration configuration, IGitUtil gitUtil, IDotnetUtil dotnetUtil, IProcessUtil processUtil, 
-        IFileDownloadUtil fileDownloadUtil, IFileUtil fileUtil, IDirectoryUtil directoryUtil)
+    public FileOperationsUtil(ILogger<FileOperationsUtil> logger, IConfiguration configuration, IGitUtil gitUtil, IDotnetUtil dotnetUtil,
+        IProcessUtil processUtil, IFileDownloadUtil fileDownloadUtil, IFileUtil fileUtil, IDirectoryUtil directoryUtil, IOpenApiFixer openApiFixer,
+        IYamlUtil yamlUtil)
     {
         _logger = logger;
         _configuration = configuration;
@@ -42,20 +47,31 @@ public sealed class FileOperationsUtil : IFileOperationsUtil
         _fileDownloadUtil = fileDownloadUtil;
         _fileUtil = fileUtil;
         _directoryUtil = directoryUtil;
+        _openApiFixer = openApiFixer;
+        _yamlUtil = yamlUtil;
     }
 
     public async ValueTask Process(CancellationToken cancellationToken = default)
     {
-        string gitDirectory = await _gitUtil.CloneToTempDirectory($"https://github.com/soenneker/{Constants.Library.ToLowerInvariantFast()}", cancellationToken: cancellationToken);
+        string gitDirectory = await _gitUtil.CloneToTempDirectory($"https://github.com/soenneker/{Constants.Library.ToLowerInvariantFast()}",
+            cancellationToken: cancellationToken);
 
-        string targetFilePath = Path.Combine(gitDirectory, "openapi.json");
+        string yamlPath = Path.Combine(gitDirectory, "openapi.yaml");
 
-        await _fileUtil.DeleteIfExists(targetFilePath, cancellationToken: cancellationToken);
+        await _fileUtil.DeleteIfExists(yamlPath, cancellationToken: cancellationToken);
 
-        string openApiDocumentUrl = _configuration["GitLab:ClientGenerationUrl"] ?? "https://gitlab.com/gitlab-org/gitlab/-/raw/master/doc/api/openapi/openapi_v3.yaml";
+        string openApiDocumentUrl = _configuration["GitLab:ClientGenerationUrl"] ??
+                                    "https://gitlab.com/gitlab-org/gitlab/-/raw/master/doc/api/openapi/openapi_v3.yaml";
 
-        string? filePath = await _fileDownloadUtil.Download(openApiDocumentUrl,
-            targetFilePath, fileExtension: ".json", cancellationToken: cancellationToken);
+        string? filePath = await _fileDownloadUtil.Download(openApiDocumentUrl, yamlPath, fileExtension: ".yaml", cancellationToken: cancellationToken);
+
+        string jsonPath = Path.Combine(gitDirectory, "openapi.json");
+
+        await _yamlUtil.SaveAsJson(filePath, jsonPath, true, cancellationToken);
+
+        string fixedPath = Path.Combine(gitDirectory, "fixed.json");
+
+        await _openApiFixer.Fix(jsonPath, fixedPath, cancellationToken);
 
         await _processUtil.Start("dotnet", null, "tool update --global Microsoft.OpenApi.Kiota", waitForExit: true, cancellationToken: cancellationToken);
 
@@ -63,10 +79,13 @@ public sealed class FileOperationsUtil : IFileOperationsUtil
 
         await DeleteAllExceptCsproj(srcDirectory, cancellationToken);
 
-        await _processUtil.Start("kiota", gitDirectory, $"kiota generate -l CSharp -d \"{filePath}\" -o src/{Constants.Library} -c GitLabOpenApiClient -n {Constants.Library}",
-            waitForExit: true, cancellationToken: cancellationToken).NoSync();
+        await _processUtil.Start("kiota", gitDirectory,
+                              $"kiota generate -l CSharp -d \"{fixedPath}\" -o src/{Constants.Library} -c GitLabOpenApiClient -n {Constants.Library}",
+                              waitForExit: true, cancellationToken: cancellationToken)
+                          .NoSync();
 
-        await BuildAndPush(gitDirectory, cancellationToken).NoSync();
+        await BuildAndPush(gitDirectory, cancellationToken)
+            .NoSync();
     }
 
     public async ValueTask DeleteAllExceptCsproj(string directoryPath, CancellationToken cancellationToken = default)
